@@ -24,12 +24,18 @@ import liquibase.database.core.MSSQLDatabase;
 import liquibase.database.core.MySQLDatabase;
 import liquibase.database.core.OracleDatabase;
 import liquibase.database.core.PostgresDatabase;
+import liquibase.exception.DatabaseException;
 import liquibase.sql.Sql;
 import liquibase.sql.UnparsedSql;
 import liquibase.sqlgenerator.SqlGeneratorChain;
 import liquibase.sqlgenerator.core.LockDatabaseChangeLogGenerator;
 import liquibase.statement.core.LockDatabaseChangeLogStatement;
+import liquibase.statement.core.RawSqlStatement;
+import liquibase.executor.ExecutorService;
 import org.jboss.logging.Logger;
+
+import java.util.List;
+
 
 /**
  * We use "SELECT FOR UPDATE" pessimistic locking (Same algorithm like Hibernate LockMode.PESSIMISTIC_WRITE )
@@ -47,16 +53,37 @@ public class CustomLockDatabaseChangeLogGenerator extends LockDatabaseChangeLogG
 
     @Override
     public Sql[] generateSql(LockDatabaseChangeLogStatement statement, Database database, SqlGeneratorChain sqlGeneratorChain) {
-
-        Sql selectForUpdateSql = generateSelectForUpdate(database,
+        return generateSelectForUpdate(database,
                 (statement instanceof CustomLockDatabaseChangeLogStatement)?
                         ((CustomLockDatabaseChangeLogStatement) statement).getId() : 1);
-
-        return new Sql[] { selectForUpdateSql };
     }
 
+    // isCockroachDB uses determines whether the Database is CockroachDB.
+    // This logic is derived from logic in liquibase v4's PostgresDatabase's
+    // getFullVersion() method.
+    private boolean isCockroachDB(Database database) {
+        if (!(database instanceof PostgresDatabase)) {
+            return false;
+        }
+        try {
+            if (database.getConnection() == null) {
+                throw new DatabaseException("Connection not set. Can not get database version. " +
+                                            "Postgres Database wasn't initialized in proper way !");
+            }
+            final String sqlToGetVersion = "SELECT version()";
+            List<?> result = ExecutorService.getInstance().getExecutor(database)
+                .queryForList(new RawSqlStatement(sqlToGetVersion), String.class);
+            if (result != null && !result.isEmpty()){
+                return result.get(0).toString().contains("CockroachDB");
+            }
+            
+            throw new DatabaseException("Connection set to Postgres type we don't support !");
+        } catch (DatabaseException e) {
+            return false;
+        }
+    }
 
-    private Sql generateSelectForUpdate(Database database, int id) {
+    private Sql[] generateSelectForUpdate(Database database, int id) {
         String catalog = database.getLiquibaseCatalogName();
         String schema = database.getLiquibaseSchemaName();
         String rawLockTableName = database.getDatabaseChangeLogLockTableName();
@@ -66,6 +93,17 @@ public class CustomLockDatabaseChangeLogGenerator extends LockDatabaseChangeLogG
 
         String sqlBase = "SELECT " + idColumnName + " FROM " + lockTableName;
         String sqlWhere = " WHERE " + idColumnName + "=" + id;
+
+        // Determine whether the database is CockroachDB, and, if so, add an
+        // additional statement to set the transaction priority to low so that
+        // regular priority reads push the locking transaction but other
+        // locking transactions block.
+        if (database instanceof PostgresDatabase && isCockroachDB(database)) {
+            return new Sql[] {
+                new UnparsedSql("SET TRANSACTION PRIORITY LOW"),
+                new UnparsedSql(sqlBase + sqlWhere + " FOR UPDATE");
+            };
+        }
 
         String sql;
         if (database instanceof MySQLDatabase || database instanceof PostgresDatabase || database instanceof H2Database ||
@@ -81,8 +119,8 @@ public class CustomLockDatabaseChangeLogGenerator extends LockDatabaseChangeLogG
         }
 
         logger.debugf("SQL command for pessimistic lock: %s", sql);
-        
-        return new UnparsedSql(sql);
+        Sql stmt =  new UnparsedSql(sql);
+        return new Sql[] { stmt };
     }
 
 }
